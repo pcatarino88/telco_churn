@@ -171,3 +171,15 @@ def scaling(df):
     df[df.columns] = scaler.fit_transform(df[df.columns])
     
     return df
+
+
+def select_important_variables(df):
+    """
+    Selects only important variables from the dataframe that were identified during feature selection and adds 'Churn Value' column.
+    """
+    important_variables = [
+        'Contract Duration', 'Dependents', 'Internet Type', 'Monthly Charge', 'Number of Referrals_bins', 'Paperless Billing', 
+        'Payment Method_Credit Card', 'Senior Citizen', 'Tenure in Months', 'Total Extra Data Charges per Month', 
+        'Total Long Distance Charges per Month', 'Unlimited Data'] + ['Churn Value']
+
+    return df[important_variables]

@@ -32,7 +32,8 @@ def cleaning (df):
     df = df.drop(
         columns=[
             'Under 30', 'Age', 'Number of Dependents', 'Country', 'State','Zip Code','Lat Long','Referred a Friend','Number of Referrals', 'Churn Label','Churn Score',
-            'Quarter','ID','Total Charges', 'Total Refunds', 'Total Extra Data Charges', 'Total Long Distance Charges', 'Total Revenue','Avg Monthly Long Distance Charges','CLTV','Population'
+            'Quarter','ID','Total Charges', 'Total Refunds', 'Total Extra Data Charges', 'Total Long Distance Charges', 'Total Revenue','Avg Monthly Long Distance Charges',
+            'City','CLTV','Population'
             ]
         )
     
@@ -51,8 +52,8 @@ def create_geoclusters(df, random_state=42):
     kmeans = KMeans(n_clusters=5, random_state=random_state)
     df.loc[coords.index, 'GeoCluster'] = kmeans.fit_predict(coords)
 
-    # drop 'City', 'Latitude' and 'Longitude' columns
-    df = df.drop(columns=['City', 'Latitude', 'Longitude'])
+    # drop 'Latitude' and 'Longitude' columns
+    df = df.drop(columns=['Latitude', 'Longitude'])
 
     return df
 
@@ -66,6 +67,10 @@ def feature_engineering(df):
     4) Creates ordered "Phone Service" categorical variable: 0 'No Phone Service', 1 'Yes' and 2 'Yes_Multiple Lines' (when 'Phone Service' is 'Yes' and 'Multiple Lines' is 'Yes')
     5) Drop leakage columns for modelling
     """
+    # 0. if exist, drop 'Latitude' and 'Longitude' columns
+    if all(col in df.columns for col in ['Latitude', 'Longitude']):
+        df = df.drop(columns=['Latitude', 'Longitude'])
+
     # 1. Create a new feature 'Streaming Services' that indicates if a customer has any streaming services and drops the original columns
     df['Streaming Services'] = np.where(
         (df['Streaming Music'] == 'Yes') | (df['Streaming TV'] == 'Yes') | (df['Streaming Movies'] == 'Yes'),

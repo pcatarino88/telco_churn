@@ -1,323 +1,508 @@
-import os
-import pickle
-from datetime import datetime
-
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-# ----------------------------
-# CONFIG 
-# ----------------------------
-
-APP_TITLE = "Churn Prediction Dashboard"
-
-MODEL_PATH = "models/best_lgb_model.pkl"
-
-DF_FINAL_PATH = "data/final_dfs/df_final.parquet"  
-X_PATH = "data/final_dfs/X.parquet"                
-
-# Identify customers 
-CUSTOMER_ID_COL = "Customer ID" 
-
-# Columns in df_final containing baseline prediction/prob and customer segment
-BASELINE_PROBA_COL = "Churn Prediction Probability"   
-BASELINE_PRED_COL = "Churn Prediction"    
-SEGMENT_COL = "segment"             
-
-# Features to Simulate
-WHATIF_NUMERIC_FEATURES = [
-    # Empty for now
-]
-
-WHATIF_CATEGORICAL_FEATURES = [
-    "Contract Duration",
-    "Number of Referrals_bins",
-    "Internet Type"
-]
-
-# Mapping from a df_final categorical feature to one-hot columns in X
-# Example:
-#   "contract_type": {
-#        "Month-to-month": ["contract_type_Month-to-month"],
-#        "One year": ["contract_type_One year"],
-#        "Two year": ["contract_type_Two year"],
-#   }
-ONEHOT_MAP = {
-    # "contract_type": {
-    #     "Month-to-month": ["contract_type_Month-to-month"],
-    #     "One year": ["contract_type_One year"],
-    #     "Two year": ["contract_type_Two year"],
-    # }
-}
-
-# For numeric features, specify which column in X corresponds to that feature.
-# If you used a simple scaler without renaming, it's often the same name.
-# Example: {"tenure_months": "tenure_months"}
-NUMERIC_X_COL_MAP = {
-    # "monthly_charges": "monthly_charges",
-    # "tenure_months": "tenure_months",
-}
-
-APP_TITLE = "Churn Prediction Dashboard"
+import matplotlib.pyplot as plt
+import shap
 
 
-# ----------------------------
-# HELPERS
-# ----------------------------
-@st.cache_resource
-def load_model(path: str):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Model not found at: {path}")
-    with open(path, "rb") as f:
-        return pickle.load(f)
+# -------------------------
+# Config
+# -------------------------
+PIPE_PATH = "models/best_churn_pipeline.pkl"
+DATA_PATH = "data/final_dfs/df_final.parquet"
+TARGET_COL = "Churn Value"
+DEFAULT_THRESHOLD = 0.60
 
-@st.cache_data
-def load_table(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"File not found at: {path}")
+COL_REFERRALS = "Number of Referrals"
+COL_CONTRACT = "Contract"
+COL_PAPERLESS = "Paperless Billing"
 
-    if path.endswith(".parquet"):
-        return pd.read_parquet(path)
-    if path.endswith(".csv"):
-        return pd.read_csv(path)
-    raise ValueError("Unsupported file type. Use .parquet or .csv")
+MONTHLY = "Month-to-Month"
+ONE_YEAR = "One Year"
+TWO_YEAR = "Two Year"
 
-@st.cache_data
-def build_robust_scaler_stats(df_final: pd.DataFrame, numeric_features):
-    """
-    Compute RobustScaler parameters from df_final: median, q1, q3, iqr.
-    NOTE: Ideally compute from the TRAIN set used during training.
-    """
-    stats = {}
-    for f in numeric_features:
-        if f not in df_final.columns:
-            raise KeyError(f"Numeric feature '{f}' not found in df_final.")
-
-        s = pd.to_numeric(df_final[f], errors="coerce").dropna()
-        if s.empty:
-            raise ValueError(f"Numeric feature '{f}' has no valid numeric values.")
-
-        q1 = float(s.quantile(0.25))
-        q3 = float(s.quantile(0.75))
-        med = float(s.median())
-        iqr = q3 - q1
-
-        # Guard: avoid divide-by-zero (constant feature)
-        if iqr == 0:
-            iqr = 1e-9
-
-        stats[f] = {"median": med, "iqr": iqr, "q1": q1, "q3": q3}
-    return stats
-
-def robust_scale(value: float, median: float, iqr: float) -> float:
-    return float((value - median) / iqr)
+st.set_page_config(page_title="Churn What-if Simulator", layout="wide")
+st.title("Churn What-if Simulator")
 
 
-def get_customer_key(df_final: pd.DataFrame, row_idx: int):
-    if CUSTOMER_ID_COL and CUSTOMER_ID_COL in df_final.columns:
-        return df_final.iloc[row_idx][CUSTOMER_ID_COL]
-    return row_idx
-
-
-def predict_proba(model, x_row: pd.Series) -> float:
-    # LightGBM sklearn wrapper uses predict_proba
-    proba = model.predict_proba(x_row.to_frame().T)[:, 1]
-    return float(proba[0])
-
-
-# ----------------------------
-# APP
-# ----------------------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
-
+# -------------------------
 # Load assets
-try:
-    model = load_model(MODEL_PATH)
-    df_final = load_table(DF_FINAL_PATH)
-    X = load_table(X_PATH)
-except Exception as e:
-    st.error(str(e))
-    st.stop()
+# -------------------------
+@st.cache_resource
+def load_pipe():
+    return joblib.load(PIPE_PATH)
 
-# Basic validation
-if len(df_final) != len(X):
-    st.error(f"df_final and X must have the same number of rows. Got {len(df_final)} vs {len(X)}.")
-    st.stop()
+@st.cache_data
+def load_df():
+    return pd.read_parquet(DATA_PATH)
 
-# Build numeric mapping functions (original -> scaled)
-try:
-    numeric_interpolators = build_numeric_interpolators(
-        df_final, X,
-        WHATIF_NUMERIC_FEATURES,
-        NUMERIC_X_COL_MAP
+pipe = load_pipe()
+df = load_df()
+
+X_base = df.drop(columns=[TARGET_COL], errors="ignore")
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def predict_proba(pipeline, X: pd.DataFrame) -> np.ndarray:
+    return pipeline.predict_proba(X)[:, 1]
+
+def churn_rate(proba: np.ndarray, threshold: float) -> float:
+    return float((proba >= threshold).mean())
+
+def minimal_flip_indices(candidates: np.ndarray, k: int, seed: int) -> np.ndarray:
+    """Pick k indices from candidates without replacement (or fewer if not enough)."""
+    if k <= 0 or len(candidates) == 0:
+        return np.array([], dtype=int)
+    rng = np.random.default_rng(seed)
+    k = min(k, len(candidates))
+    return rng.choice(candidates, size=k, replace=False)
+
+def apply_referrals_hierarchical(
+    series: pd.Series,
+    p_has_referrals_target: float,
+    p_ge2_given_has_target: float,
+    seed: int = 42
+) -> pd.Series:
+    """
+    Adjust referrals with minimal changes:
+    - Stage 1: set share of customers with referrals (>=1) by flipping 0 <-> 1
+    - Stage 2: among customers with >=1, set share with >=2 by flipping 1 <-> 2
+    This keeps distribution close and avoids reshuffling everything.
+    """
+    s = pd.to_numeric(series, errors="coerce").fillna(0).round().astype(int).copy()
+    n = len(s)
+
+    # --- Stage 1: target # with >=1 ---
+    cur_has = (s >= 1).sum()
+    tgt_has = int(round(p_has_referrals_target * n))
+    diff = tgt_has - cur_has
+
+    if diff > 0:
+        # need more with >=1: flip some 0 -> 1
+        idx0 = np.where(s.to_numpy() == 0)[0]
+        pick = minimal_flip_indices(idx0, diff, seed=seed)
+        s.iloc[pick] = 1
+    elif diff < 0:
+        # need fewer with >=1: flip some 1 -> 0 (prefer those with exactly 1)
+        idx1 = np.where(s.to_numpy() == 1)[0]
+        pick = minimal_flip_indices(idx1, -diff, seed=seed)
+        s.iloc[pick] = 0
+        # If not enough 1s, we could also downgrade 2+ to 0, but keep it simple.
+
+    # --- Stage 2: among >=1, target # with >=2 ---
+    has_mask = (s >= 1).to_numpy()
+    n_has = int(has_mask.sum())
+    if n_has == 0:
+        return s
+
+    cur_ge2 = (s[has_mask] >= 2).sum()
+    tgt_ge2 = int(round(p_ge2_given_has_target * n_has))
+    diff2 = tgt_ge2 - cur_ge2
+
+    if diff2 > 0:
+        # need more >=2: flip some 1 -> 2
+        idx1 = np.where(s.to_numpy() == 1)[0]
+        pick = minimal_flip_indices(idx1, diff2, seed=seed + 1)
+        s.iloc[pick] = 2
+    elif diff2 < 0:
+        # need fewer >=2: flip some 2 -> 1 (prefer exactly 2)
+        idx2 = np.where(s.to_numpy() == 2)[0]
+        pick = minimal_flip_indices(idx2, -diff2, seed=seed + 1)
+        s.iloc[pick] = 1
+        # (If you have many 3,4,5... you can extend this; for now keep simple.)
+
+    return s
+
+def apply_contract_hierarchical(
+    series: pd.Series,
+    p_monthly_target: float,
+    p_two_year_given_annual_target: float,
+    seed: int = 42
+) -> pd.Series:
+    """
+    Adjust contract with minimal changes:
+    - Stage 1: set share of Month-to-Month by moving customers between monthly <-> annual
+      (we move from the majority annual type to keep minimal disruption)
+    - Stage 2: among annual (One Year + Two Year), set share of Two Year by swapping One Year <-> Two Year
+    """
+    s = series.astype(str).copy()
+    n = len(s)
+
+    # Treat unknown labels as-is, but only operate on known ones.
+    known_mask = s.isin([MONTHLY, ONE_YEAR, TWO_YEAR]).to_numpy()
+    if known_mask.sum() == 0:
+        return s
+
+    # Work on known subset indices
+    idx_known = np.where(known_mask)[0]
+    s_known = s.iloc[idx_known].copy()
+    nk = len(s_known)
+
+    # --- Stage 1: target monthly count ---
+    cur_monthly = (s_known == MONTHLY).sum()
+    tgt_monthly = int(round(p_monthly_target * nk))
+    diff = tgt_monthly - cur_monthly
+
+    if diff > 0:
+        # need more monthly: convert some annual -> monthly
+        idx_annual = np.where((s_known.to_numpy() == ONE_YEAR) | (s_known.to_numpy() == TWO_YEAR))[0]
+        pick_local = minimal_flip_indices(idx_annual, diff, seed=seed)
+        s_known.iloc[pick_local] = MONTHLY
+    elif diff < 0:
+        # need fewer monthly: convert some monthly -> annual
+        idx_m = np.where(s_known.to_numpy() == MONTHLY)[0]
+        pick_local = minimal_flip_indices(idx_m, -diff, seed=seed)
+
+        # choose where to send them: preserve current annual mix by sending to majority annual class
+        cur_one = (s_known == ONE_YEAR).sum()
+        cur_two = (s_known == TWO_YEAR).sum()
+        send_to = TWO_YEAR if cur_two >= cur_one else ONE_YEAR
+        s_known.iloc[pick_local] = send_to
+
+    # --- Stage 2: among annual, target two-year share ---
+    annual_mask = (s_known != MONTHLY).to_numpy()
+    n_annual = int(annual_mask.sum())
+    if n_annual == 0:
+        s.iloc[idx_known] = s_known
+        return s
+
+    cur_two = (s_known[annual_mask] == TWO_YEAR).sum()
+    tgt_two = int(round(p_two_year_given_annual_target * n_annual))
+    diff2 = tgt_two - cur_two
+
+    if diff2 > 0:
+        # need more two-year: flip some one-year -> two-year
+        idx_one = np.where(s_known.to_numpy() == ONE_YEAR)[0]
+        pick_local = minimal_flip_indices(idx_one, diff2, seed=seed + 1)
+        s_known.iloc[pick_local] = TWO_YEAR
+    elif diff2 < 0:
+        # need fewer two-year: flip some two-year -> one-year
+        idx_two = np.where(s_known.to_numpy() == TWO_YEAR)[0]
+        pick_local = minimal_flip_indices(idx_two, -diff2, seed=seed + 1)
+        s_known.iloc[pick_local] = ONE_YEAR
+
+    s.iloc[idx_known] = s_known
+    return s
+
+
+# -------------------------
+# UI
+# -------------------------
+tab1, tab2 = st.tabs(["🔄 What-if Simulation", "📊 Model & Insights"])
+
+with st.sidebar:
+    st.header("Controls")
+    threshold = st.slider(
+        "Churn threshold (for churn-rate display)",
+        min_value=0.05, max_value=0.95, value=float(DEFAULT_THRESHOLD), step=0.01
     )
-except Exception as e:
-    st.warning("Numeric what-if mapping not ready yet. Fix config at top of app.py.")
-    st.warning(str(e))
-    numeric_interpolators = {}
+    seed = st.number_input("Random seed", min_value=0, value=42, step=1)
 
-tab1, tab2 = st.tabs(["Tab 1 — What-if Simulator", "Tab 2 — Model & Insights"])
+    st.divider()
+    st.subheader("Scenario toggles (use 1 or all)")
+    use_referrals = st.checkbox("Simulate Referrals (hierarchical)", value=True)
+    use_contract = st.checkbox("Simulate Contract Mix (hierarchical)", value=True)
+    use_paperless = st.checkbox("Simulate Paperless Billing", value=True)
 
 
-# ----------------------------
-# TAB 1: WHAT-IF
-# ----------------------------
 with tab1:
-    st.subheader("What-if Simulator")
+    st.subheader("🧪 Scenario builder")
 
-    left, right = st.columns([1, 2])
+    # Baseline prediction
+    base_proba = predict_proba(pipe, X_base)
 
-    with left:
-        # Customer selection
-        if CUSTOMER_ID_COL and CUSTOMER_ID_COL in df_final.columns:
-            customer_ids = df_final[CUSTOMER_ID_COL].astype(str).tolist()
-            selected_id = st.selectbox("Select customer", customer_ids)
-            idx = df_final.index[df_final[CUSTOMER_ID_COL].astype(str) == selected_id][0]
+    # Baseline stats — Referrals
+    referrals_base = None
+    p_has_ref_base = None
+    p_ge2_given_has_base = None
+    if COL_REFERRALS in X_base.columns:
+        referrals_base = pd.to_numeric(X_base[COL_REFERRALS], errors="coerce").fillna(0).round().astype(int)
+        p_has_ref_base = float((referrals_base >= 1).mean())
+        has_mask = (referrals_base >= 1)
+        p_ge2_given_has_base = float((referrals_base[has_mask] >= 2).mean()) if has_mask.any() else 0.0
+
+    # Baseline stats — Contract
+    contract_base = None
+    p_monthly_base = None
+    p_two_given_annual_base = None
+    if COL_CONTRACT in X_base.columns:
+        contract_base = X_base[COL_CONTRACT].astype(str)
+        known = contract_base.isin([MONTHLY, ONE_YEAR, TWO_YEAR])
+        if known.any():
+            ck = contract_base[known]
+            p_monthly_base = float((ck == MONTHLY).mean())
+            annual = ck[ck != MONTHLY]
+            p_two_given_annual_base = float((annual == TWO_YEAR).mean()) if len(annual) > 0 else 0.0
+
+    # Baseline stats — Paperless
+    paperless_yes_base = None
+    if COL_PAPERLESS in X_base.columns:
+        paperless_yes_base = float((X_base[COL_PAPERLESS].astype(str) == "Yes").mean())
+
+    # UI controls (defaults = baseline)
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("### Referrals (hierarchical)")
+        if referrals_base is None:
+            st.info(f"Column '{COL_REFERRALS}' not found.")
+            p_has_ref_target = 0.0
+            p_ge2_given_has_target = 0.0
         else:
-            idx = st.number_input("Select row index", min_value=0, max_value=len(df_final)-1, value=0, step=1)
+            st.write(f"Baseline: **{p_has_ref_base:.1%}** have ≥1 referral")
+            st.write(f"Among those: **{p_ge2_given_has_base:.1%}** have ≥2 referrals")
 
-        baseline_x = X.iloc[int(idx)].copy()
-        baseline_proba = predict_proba(model, baseline_x)
+            p_has_ref_target = st.slider(
+                "Target % with ≥1 referral",
+                0.0, 100.0,
+                value=float(round(p_has_ref_base * 100, 1)),
+                step=0.5,
+                disabled=not use_referrals
+            ) / 100.0
 
-        st.markdown("### Baseline")
-        st.write("Customer:", get_customer_key(df_final, int(idx)))
-        if SEGMENT_COL and SEGMENT_COL in df_final.columns:
-            st.write("Segment:", df_final.iloc[int(idx)][SEGMENT_COL])
+            p_ge2_given_has_target = st.slider(
+                "Target % with ≥2 (given ≥1)",
+                0.0, 100.0,
+                value=float(round(p_ge2_given_has_base * 100, 1)),
+                step=0.5,
+                disabled=not use_referrals
+            ) / 100.0
 
-        st.metric("Baseline churn probability", f"{baseline_proba:.3f}")
+    with c2:
+        st.markdown("### Contract Mix (hierarchical)")
+        if contract_base is None or p_monthly_base is None:
+            st.info(f"Column '{COL_CONTRACT}' not found (or unexpected labels).")
+            p_monthly_target = 0.0
+            p_two_given_annual_target = 0.0
+        else:
+            st.write(f"Baseline: **{p_monthly_base:.1%}** Month-to-Month")
+            st.write(f"Among annual: **{p_two_given_annual_base:.1%}** Two Year")
 
-        if BASELINE_PROBA_COL and BASELINE_PROBA_COL in df_final.columns:
-            st.caption(f"(df_final stored baseline proba: {df_final.iloc[int(idx)][BASELINE_PROBA_COL]})")
+            p_monthly_target = st.slider(
+                "Target % Month-to-Month",
+                0.0, 100.0,
+                value=float(round(p_monthly_base * 100, 1)),
+                step=0.5,
+                disabled=not use_contract
+            ) / 100.0
 
-    with right:
-        st.markdown("### Edit features (human-readable)")
+            p_two_given_annual_target = st.slider(
+                "Target % Two Year (given annual)",
+                0.0, 100.0,
+                value=float(round(p_two_given_annual_base * 100, 1)),
+                step=0.5,
+                disabled=not use_contract
+            ) / 100.0
 
-        # Start from baseline X row (scaled/encoded)
-        new_x = baseline_x.copy()
+    with c3:
+        st.markdown("### Paperless Billing")
+        if paperless_yes_base is None:
+            st.info(f"Column '{COL_PAPERLESS}' not found.")
+            paperless_yes_target = None
+        else:
+            st.write(f"Baseline 'Yes': **{paperless_yes_base:.1%}**")
+            st.write(f"Baseline 'No': **{1 - paperless_yes_base:.1%}**")
+            paperless_yes_target = st.slider(
+                "Target % 'Yes'",
+                0.0, 100.0,
+                value=float(round(paperless_yes_base * 100, 1)),
+                step=0.5,
+                disabled=not use_paperless
+            ) / 100.0
 
-        # Numeric edits
-        if WHATIF_NUMERIC_FEATURES:
-            st.markdown("#### Numeric features")
-            for f in WHATIF_NUMERIC_FEATURES:
-                if f not in df_final.columns:
-                    st.warning(f"'{f}' not found in df_final")
-                    continue
-                current_val = df_final.iloc[int(idx)][f]
+    # Build scenario from baseline with minimal changes
+    X_scenario = X_base.copy()
 
-                # slider range from quantiles for stability
-                q01 = float(df_final[f].quantile(0.01))
-                q99 = float(df_final[f].quantile(0.99))
-                if not np.isfinite(q01) or not np.isfinite(q99) or q01 == q99:
-                    q01 = float(df_final[f].min())
-                    q99 = float(df_final[f].max())
+    if use_referrals and referrals_base is not None:
+        X_scenario[COL_REFERRALS] = apply_referrals_hierarchical(
+            X_scenario[COL_REFERRALS],
+            p_has_referrals_target=p_has_ref_target,
+            p_ge2_given_has_target=p_ge2_given_has_target,
+            seed=int(seed),
+        )
 
-                v_new = st.slider(
-                    label=f,
-                    min_value=float(q01),
-                    max_value=float(q99),
-                    value=float(np.clip(current_val, q01, q99)) if np.isfinite(current_val) else float(q01),
+    if use_contract and contract_base is not None and p_monthly_base is not None:
+        X_scenario[COL_CONTRACT] = apply_contract_hierarchical(
+            X_scenario[COL_CONTRACT],
+            p_monthly_target=p_monthly_target,
+            p_two_year_given_annual_target=p_two_given_annual_target,
+            seed=int(seed),
+        )
+
+    if use_paperless and paperless_yes_base is not None and paperless_yes_target is not None:
+        # Minimal flips for paperless: same helper as before but inlined here
+        s = X_scenario[COL_PAPERLESS].astype(str).copy()
+        n = len(s)
+        cur_yes = int((s == "Yes").sum())
+        tgt_yes = int(round(paperless_yes_target * n))
+        diff = tgt_yes - cur_yes
+        if diff != 0:
+            if diff > 0:
+                idx = np.where(s.to_numpy() == "No")[0]
+                pick = minimal_flip_indices(idx, diff, seed=int(seed) + 10)
+                s.iloc[pick] = "Yes"
+            else:
+                idx = np.where(s.to_numpy() == "Yes")[0]
+                pick = minimal_flip_indices(idx, -diff, seed=int(seed) + 10)
+                s.iloc[pick] = "No"
+        X_scenario[COL_PAPERLESS] = s
+
+    # Predict scenario
+    scen_proba = predict_proba(pipe, X_scenario)
+
+    # -------------------------------------------------
+    # Summary Results
+    # -------------------------------------------------
+    st.divider()
+
+    st.subheader("🎯 Impact summary")
+
+    # Metrics
+    base_mean = float(np.mean(base_proba))
+    scen_mean = float(np.mean(scen_proba))
+    base_rate = churn_rate(base_proba, threshold)
+    scen_rate = churn_rate(scen_proba, threshold)
+
+    m1, m2 = st.columns(2)
+    m1.metric(f"Baseline churn rate (≥ {threshold:.2f})", f"{base_rate:.2%}")
+    m2.metric(f"Scenario churn rate (≥ {threshold:.2f})", f"{scen_rate:.2%}", f"{(scen_rate-base_rate):+.2%}")
+
+    
+    # -------------------------------------------------
+    # Visualization of distributions
+    # -------------------------------------------------
+    st.divider()
+
+    st.subheader("📊 Distribution shift")
+
+    def plot_hist_with_counts(ax, data, bins, title):
+        counts, bin_edges, patches = ax.hist(data, bins=bins)
+        ax.set_title(title)
+        ax.set_xlabel("Probability")
+        ax.set_ylabel("Customers")
+        ax.set_ylim(0, 3500)
+
+        # Add count labels on top of bars
+        for count, patch in zip(counts, patches):
+            if count > 0:
+                x = patch.get_x() + patch.get_width() / 2
+                y = patch.get_height()
+                ax.annotate(
+                    f"{int(count)}",
+                    (x, y),
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    xytext=(0, 2),
+                    textcoords="offset points"
                 )
 
-                # Map to scaled column in X via interpolator
-                if f in numeric_interpolators and f in NUMERIC_X_COL_MAP:
-                    x_col = NUMERIC_X_COL_MAP[f]
-                    new_x[x_col] = numeric_interpolators[f](v_new)
-                else:
-                    st.info(f"No mapping for '{f}'. Configure NUMERIC_X_COL_MAP and ensure interpolator builds.")
+    pA, pB = st.columns(2)
 
-        # Categorical edits (one-hot)
-        if WHATIF_CATEGORICAL_FEATURES:
-            st.markdown("#### Categorical features")
-            for f in WHATIF_CATEGORICAL_FEATURES:
-                if f not in df_final.columns:
-                    st.warning(f"'{f}' not found in df_final")
-                    continue
-                if f not in ONEHOT_MAP:
-                    st.info(f"No one-hot mapping for '{f}'. Configure ONEHOT_MAP.")
-                    continue
+    with pA:
+        fig, ax = plt.subplots(figsize=(6, 3))
+        plot_hist_with_counts(
+            ax,
+            base_proba,
+            bins=5,
+            title="Baseline churn probability"
+        )
+        st.pyplot(fig)
 
-                options = list(ONEHOT_MAP[f].keys())
-                current = df_final.iloc[int(idx)][f]
-                default_idx = options.index(current) if current in options else 0
+    with pB:
+        fig, ax = plt.subplots(figsize=(6, 3))
+        plot_hist_with_counts(
+            ax,
+            scen_proba,
+            bins=5,
+            title="Scenario churn probability"
+        )
+        st.pyplot(fig)
 
-                chosen = st.selectbox(f, options, index=default_idx)
+# -------------------------------------------------
+# TAB 2
+# -------------------------------------------------
 
-                # Zero all relevant one-hot columns
-                all_cols = sorted({c for cols in ONEHOT_MAP[f].values() for c in cols})
-                for c in all_cols:
-                    if c in new_x.index:
-                        new_x[c] = 0.0
-
-                # Set chosen category columns to 1
-                for c in ONEHOT_MAP[f][chosen]:
-                    if c in new_x.index:
-                        new_x[c] = 1.0
-
-        st.divider()
-
-        # Predict with modified vector
-        new_proba = predict_proba(model, new_x)
-        delta = new_proba - baseline_proba
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("New churn probability", f"{new_proba:.3f}", f"{delta:+.3f}")
-        c2.metric("Baseline", f"{baseline_proba:.3f}")
-        c3.metric("Change", f"{delta:+.3f}")
-
-        with st.expander("Show edited X row (model input)"):
-            st.dataframe(pd.DataFrame({"baseline": baseline_x, "new": new_x}))
-
-
-# ----------------------------
-# TAB 2: MODEL & INSIGHTS
-# ----------------------------
 with tab2:
-    st.subheader("Model & Insights")
 
-    st.markdown("### Model summary")
-    st.write("Model type:", type(model).__name__)
-    st.write("Number of features:", X.shape[1])
-    st.write("Number of customers:", X.shape[0])
+    model = pipe.named_steps.get("model", None)
+    preprocess = pipe.named_steps.get("preprocess", None)
 
-    with st.expander("Model parameters"):
-        try:
-            st.json(model.get_params())
-        except Exception:
-            st.write("Could not read model params via get_params().")
-
-    st.markdown("### Feature importance (gain-based / split-based depending on wrapper)")
-    try:
-        importances = getattr(model, "feature_importances_", None)
-        if importances is None:
-            st.info("No feature_importances_ found on this model object.")
-        else:
-            fi = pd.DataFrame({
-                "feature": X.columns,
-                "importance": importances
-            }).sort_values("importance", ascending=False)
-
-            st.dataframe(fi.head(30), use_container_width=True)
-
-            # Simple bar chart
-            st.bar_chart(fi.head(30).set_index("feature")["importance"])
-    except Exception as e:
-        st.warning(f"Could not compute feature importance: {e}")
-
-    st.markdown("### Baseline churn distribution")
-    # Show distribution of model probabilities for all customers
-    try:
-        # predict in chunks if needed later; for now assume manageable
-        probs = model.predict_proba(X)[:, 1]
-        s = pd.Series(probs, name="churn_probability")
-        st.write(s.describe())
-        st.line_chart(s.sort_values(ignore_index=True))
-    except Exception as e:
-        st.warning(f"Could not compute probability distribution: {e}")
-
-    st.markdown("### Your model results")
-    st.info(
-        "If you have a metrics JSON (AUC/F1/confusion matrix) from training, "
-        "save it as `models/metrics.json` and we can load & display it here."
+    st.markdown("### ⚙️ Model summary")
+    st.write("Model type:", type(model).__name__ if model is not None else "Unknown")
+    st.write("Customers:", f"{len(X_base):,}")
+    st.write("Key Model Parameters:")
+    params = model.get_params()
+    
+    key_params = {
+        "Boosting": params.get("boosting_type"),
+        "Trees (n_estimators)": params.get("n_estimators"),
+        "Learning rate": params.get("learning_rate"),
+        "Max depth": params.get("max_depth"),
+        "Num leaves": params.get("num_leaves"),
+        "Min child samples": params.get("min_child_samples"),
+        "Subsample": params.get("subsample"),
+        "Colsample by tree": params.get("colsample_bytree"),
+        "Class weight": params.get("class_weight"),
+        "Random state": params.get("random_state"),
+    }
+    
+    # Display as a clean table (best for readability)
+    params_df = (
+        pd.DataFrame.from_dict(key_params, orient="index", columns=["Value"])
+        .reset_index()
+        .rename(columns={"index": "Parameter"})
     )
+
+    st.dataframe(params_df, use_container_width=True, hide_index=True)
+
+    # -------------------------------------------------
+    # Shap Values
+    # -------------------------------------------------
+    st.divider()
+
+    st.markdown("### 🧠 SHAP summary (feature impact)")
+
+    model = pipe.named_steps.get("model", None)
+    preprocess = pipe.named_steps.get("preprocess", None)
+
+    if model is None or preprocess is None:
+        st.info("Pipeline does not expose 'model' and/or 'preprocess' steps.")
+    else:
+        # Choose a sample size (SHAP can be slow on full population)
+        max_rows = 2000
+        sample_seed = 42
+
+        X_sample = X_base.sample(n=min(max_rows, len(X_base)), random_state=int(sample_seed))
+
+        # Transform raw -> model input
+        X_prepped = preprocess.transform(X_sample)
+
+        # Try to get feature names for the plot
+        feature_names = None
+        if hasattr(preprocess, "important_features"):
+            feature_names = list(preprocess.important_features)
+        elif hasattr(model, "feature_name_"):
+            feature_names = list(model.feature_name_)
+
+        # Make X_prepped a DataFrame if it's numpy
+        if not hasattr(X_prepped, "columns"):
+            if feature_names is None:
+                feature_names = [f"f{i}" for i in range(X_prepped.shape[1])]
+            X_prepped = pd.DataFrame(X_prepped, columns=feature_names, index=X_sample.index)
+
+        # SHAP computation
+        with st.spinner("Computing SHAP values..."):
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_prepped)
+
+        # For binary classification, shap_values may be a list [class0, class1]
+        sv = shap_values[1] if isinstance(shap_values, list) else shap_values
+
+        # Plot
+        fig, ax = plt.subplots(figsize=(12, 5))
+        shap.summary_plot(sv, X_prepped, show=False, plot_size=None)
+        st.pyplot(fig, clear_figure=True)

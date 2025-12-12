@@ -366,9 +366,10 @@ with tab1:
     base_rate = churn_rate(base_proba, threshold)
     scen_rate = churn_rate(scen_proba, threshold)
 
-    m1, m2 = st.columns(2)
+    m1, m2, m3 = st.columns(3)
     m1.metric(f"Baseline churn rate (≥ {threshold:.2f})", f"{base_rate:.2%}")
     m2.metric(f"Scenario churn rate (≥ {threshold:.2f})", f"{scen_rate:.2%}", f"{(scen_rate-base_rate):+.2%}")
+    m3.metric(f"Delta number of churns:", f"{int(round(scen_rate * len(X_base))) - int(round(base_rate * len(X_base))):+,.0f}")
 
     
     # -------------------------------------------------

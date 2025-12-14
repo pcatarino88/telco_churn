@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, accuracy_score, f1_score
 import shap
 
 
@@ -246,7 +247,7 @@ with tab1:
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        st.markdown("### Referrals (hierarchical)")
+        st.markdown("#### Referrals")
         if referrals_base is None:
             st.info(f"Column '{COL_REFERRALS}' not found.")
             p_has_ref_target = 0.0
@@ -272,7 +273,7 @@ with tab1:
             ) / 100.0
 
     with c2:
-        st.markdown("### Contract Mix (hierarchical)")
+        st.markdown("#### Contract Duration")
         if contract_base is None or p_monthly_base is None:
             st.info(f"Column '{COL_CONTRACT}' not found (or unexpected labels).")
             p_monthly_target = 0.0
@@ -298,7 +299,7 @@ with tab1:
             ) / 100.0
 
     with c3:
-        st.markdown("### Paperless Billing")
+        st.markdown("#### Paperless Billing")
         if paperless_yes_base is None:
             st.info(f"Column '{COL_PAPERLESS}' not found.")
             paperless_yes_target = None
@@ -432,6 +433,11 @@ with tab2:
     model = pipe.named_steps.get("model", None)
     preprocess = pipe.named_steps.get("preprocess", None)
 
+
+    # -------------------------------------------------
+    # Model Summary
+    # -------------------------------------------------
+
     st.markdown("### ⚙️ Model summary")
     st.write("Model type:", type(model).__name__ if model is not None else "Unknown")
     st.write("Customers:", f"{len(X_base):,}")
@@ -459,6 +465,93 @@ with tab2:
     )
 
     st.dataframe(params_df, use_container_width=True, hide_index=True)
+
+
+    # -------------------------------------------------
+    # Model Results
+    # -------------------------------------------------
+    st.divider()
+    st.markdown("### 📌 Model Results")
+
+    X_eval = X_base.copy()
+    y_eval = None
+    if TARGET_COL in df.columns:
+        y_eval = df[TARGET_COL].astype(int)
+
+    if y_eval is None:
+        st.info(f"'{TARGET_COL}' not found in dataset — cannot compute confusion matrix / metrics.")
+    else:
+        # Probabilities + thresholded predictions
+        proba = pipe.predict_proba(X_eval)[:, 1]
+        y_pred = (proba >= threshold).astype(int)
+
+        # Confusion matrix + metrics
+        cm = confusion_matrix(y_eval, y_pred)
+        precision = precision_score(y_eval, y_pred, zero_division=0)
+        recall = recall_score(y_eval, y_pred, zero_division=0)
+        accuracy = accuracy_score(y_eval, y_pred)
+        f1 = f1_score(y_eval, y_pred, zero_division=0)
+
+        left, right = st.columns([1.2, 1])
+
+        with left:
+            st.markdown(f"**Confusion Matrix (threshold = {threshold:.2f})**")
+
+            # ⬇️ Smaller figure
+            fig, ax = plt.subplots(figsize=(3.8, 3.4))
+
+            color_matrix = np.array([
+                ["#2ecc71", "#f5b041"],  # TN, FP
+                ["#f5b041", "#2ecc71"]   # FN, TP
+            ])
+
+            for i in range(2):
+                for j in range(2):
+                    ax.add_patch(
+                        plt.Rectangle(
+                            (j, i), 1, 1,
+                            color=color_matrix[i, j],
+                            alpha=0.85
+                        )
+                    )
+                    ax.text(
+                        j + 0.5, i + 0.5,
+                        f"{cm[i, j]:,}",
+                        ha="center", va="center",
+                        fontsize=12,           # ⬇️ smaller text
+                        fontweight="bold",
+                        color="black"
+                    )
+
+            ax.set_xlim(0, 2)
+            ax.set_ylim(0, 2)
+
+            ax.set_xticks([0.5, 1.5])
+            ax.set_yticks([0.5, 1.5])
+            ax.set_xticklabels(["Pred 0", "Pred 1"], fontsize=10)
+            ax.set_yticklabels(["True 0", "True 1"], fontsize=10)
+
+            ax.set_xlabel("Predicted", fontsize=10)
+            ax.set_ylabel("Actual", fontsize=10)
+            ax.set_title("Confusion Matrix", fontsize=12)
+
+            ax.tick_params(left=False, bottom=False)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+
+            ax.invert_yaxis()
+
+            plt.tight_layout(pad=0.6)  # ⬅️ tighter padding
+            st.pyplot(fig, clear_figure=True)
+
+        with right:
+            st.markdown("**Key metrics**")
+            st.write("")
+            st.write("")
+            st.metric("Precision", f"{precision:.3f}")
+            st.metric("Recall", f"{recall:.3f}")
+            st.metric("Accuracy", f"{accuracy:.3f}")
+            st.metric("F1 score", f"{f1:.3f}")
 
     # -------------------------------------------------
     # Shap Values

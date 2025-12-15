@@ -12,11 +12,8 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 
-# Model artifacts
-*.pkl
-*.joblib
-
-# Data
-data/
+# Data files except final_dfs/df_final.parquet
 *.csv
 *.xlsx
+*.parquet
+!data/final_dfs/df_final.parquet

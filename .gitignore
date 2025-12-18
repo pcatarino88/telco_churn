@@ -9,6 +9,9 @@ __pycache__/
 env/
 venv/
 
+# exploration notebook
+notebooks/10_exploration.ipynb
+
 # Jupyter
 .ipynb_checkpoints/
 
